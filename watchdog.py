@@ -22,7 +22,7 @@ import traceback
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from seleniumbase import SB
+from seleniumbase import Driver
 
 # ── 环境变量 ──────────────────────────────────────────────
 DISCORD_TOKEN        = os.environ.get("WITCHLY_DISCORD_TOKEN", "").strip()
@@ -758,12 +758,14 @@ def run():
     if ENABLE_RECORDING:
         log("🎬 录屏已启用（设置 ENABLE_RECORDING=false 可关闭）")
 
-    with SB(
+    driver = Driver(
         uc=True,
-        headless=True,
-        uc_cdp_events=True,
+        headless=False,          # Driver(uc=True) 不需要 headless，配合 Xvfb 运行
+        undetectable=True,
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
-    ) as sb:
+    )
+    sb = driver                  # 其余代码全部用 sb，无需任何修改
+    with driver:
         # 🆕 启动录屏
         recorder = ScreenRecorder(sb, interval=2.0)
         recorder.start()
