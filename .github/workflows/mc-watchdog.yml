@@ -1,0 +1,99 @@
+name: 🎮 MC 服务器自动监控
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 每 5 分钟检查一次
+  workflow_dispatch:          # 支持手动触发
+
+jobs:
+  watchdog:
+    name: 检查状态 / 自动启动 / 自动续期
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 SeleniumBase 及依赖
+        run: |
+          pip install seleniumbase
+          # SeleniumBase 会自动管理 ChromeDriver，无需手动安装
+          # UC Mode 依赖 undetected-chromedriver，seleniumbase 已内置
+          python -c "import seleniumbase; print('SeleniumBase', seleniumbase.__version__)"
+
+      - name: 安装系统依赖（Chrome 运行所需）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libglib2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
+            libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+            libxss1 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libgbm1 \
+            fonts-liberation xvfb
+
+      # UC Mode 需要真实显示器环境（即使 headless，也要启动 Xvfb）
+      - name: 启动虚拟显示（Xvfb）
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+          echo "Xvfb 已启动"
+
+      # Cloudflare 会封锁 GitHub Actions IP，WARP 绕过
+      - name: 启用 Cloudflare WARP
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 修复 DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1\n' \
+            | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+          sleep 2
+          echo "=== DNS 测试 ==="
+          nslookup dash.witchly.host 1.1.1.1 || echo "DNS 解析失败，继续..."
+          echo "=== 出口 IP ==="
+          curl -s --max-time 10 https://api.ipify.org && echo
+          echo "=== WARP 状态 ==="
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace \
+            | grep -E 'ip=|warp=|loc=' || true
+
+      - name: 运行监控脚本
+        env:
+          WITCHLY_DISCORD_TOKEN: ${{ secrets.WITCHLY_DISCORD_TOKEN }}
+          WITCHLY_SERVER_ID:     ${{ secrets.WITCHLY_SERVER_ID }}
+          TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
+          RENEW_THRESHOLD_DAYS:  "3"
+          DISPLAY:               ":99"
+        run: python watchdog.py
+
+      - name: 上传截图（调试，保留 3 天）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: screenshots/
+          retention-days: 3
+
+      - name: 清理旧运行记录（只保留最新 1 条）
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 1
