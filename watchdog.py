@@ -6,6 +6,8 @@ Witchly.host MC 服务器自动监控脚本 —— SeleniumBase UC Mode 版
   2. Discord Token 注入登录
   3. 检测服务器状态，离线自动启动
   4. Stability 剩余 < 3 天自动续期（扣 500 Coins）
+  5. 🆕 自动关闭公告弹窗（Got it）
+  6. 🆕 录屏功能（ffmpeg，可选）
 """
 
 import os
@@ -13,6 +15,9 @@ import re
 import sys
 import json
 import time
+import shutil
+import threading
+import subprocess
 import traceback
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -25,10 +30,13 @@ SERVER_ID            = os.environ.get("WITCHLY_SERVER_ID", "").strip()
 TG_BOT_TOKEN         = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID           = os.environ.get("TG_CHAT_ID", "").strip()
 RENEW_THRESHOLD_DAYS = float(os.environ.get("RENEW_THRESHOLD_DAYS", "3"))
+ENABLE_RECORDING     = os.environ.get("ENABLE_RECORDING", "true").strip().lower() == "true"
 
 BASE_URL       = "https://dash.witchly.host"
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
+RECORDING_DIR  = Path("recordings")
+RECORDING_DIR.mkdir(exist_ok=True)
 
 # ── 日志 ──────────────────────────────────────────────────
 def log(msg):  print(f"[INFO]  {msg}", flush=True)
@@ -79,6 +87,88 @@ def snap(sb, name: str) -> str | None:
         warn(f"截图失败: {e}")
         return None
 
+# ── 🆕 录屏（ffmpeg 截图序列转视频）────────────────────────
+class ScreenRecorder:
+    """
+    用 ffmpeg 把 screenshots 目录下按时间顺序生成的 PNG 拼成 MP4。
+    录制期间每 N 秒自动截一帧（不依赖 X11，纯截图模式）。
+    """
+    def __init__(self, sb, interval: float = 2.0):
+        self.sb       = sb
+        self.interval = interval
+        self._frames: list[Path] = []
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._idx = 0
+
+    def start(self):
+        if not ENABLE_RECORDING:
+            return
+        self._running = True
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        log("🎬 录屏开始")
+
+    def _loop(self):
+        while self._running:
+            try:
+                name = f"rec_{self._idx:04d}"
+                path = SCREENSHOT_DIR / f"{name}.png"
+                self.sb.save_screenshot(str(path))
+                self._frames.append(path)
+                self._idx += 1
+            except Exception:
+                pass
+            time.sleep(self.interval)
+
+    def stop(self, output_name: str = "run") -> str | None:
+        if not ENABLE_RECORDING:
+            return None
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5)
+        if not self._frames:
+            warn("录屏：没有帧，跳过生成视频")
+            return None
+        return self._compile(output_name)
+
+    def _compile(self, output_name: str) -> str | None:
+        """把帧列表写成 ffmpeg concat 文件，生成 MP4。"""
+        if not shutil.which("ffmpeg"):
+            warn("ffmpeg 未安装，跳过视频合成（截图帧已保留在 screenshots/rec_*.png）")
+            return None
+
+        concat_file = RECORDING_DIR / "frames.txt"
+        with open(concat_file, "w") as f:
+            for p in self._frames:
+                f.write(f"file '{p.resolve()}'\n")
+                f.write(f"duration {self.interval}\n")
+            # ffmpeg concat demuxer 需要最后一帧再写一次（无 duration）
+            if self._frames:
+                f.write(f"file '{self._frames[-1].resolve()}'\n")
+
+        out = RECORDING_DIR / f"{output_name}.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_file),
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",   # 保证偶数尺寸
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-r", "10",          # 输出 10fps，文件小
+            str(out),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                log(f"🎬 视频已生成: {out}")
+                return str(out)
+            else:
+                warn(f"ffmpeg 失败:\n{result.stderr[-500:]}")
+                return None
+        except Exception as e:
+            warn(f"ffmpeg 异常: {e}")
+            return None
+
 # ── 等待 URL 包含关键字 ───────────────────────────────────
 def wait_for_url(sb, keyword: str, timeout: int = 20) -> bool:
     deadline = time.time() + timeout
@@ -90,28 +180,60 @@ def wait_for_url(sb, keyword: str, timeout: int = 20) -> bool:
 
 # ── Cloudflare Turnstile 处理 ─────────────────────────────
 def handle_cloudflare(sb):
-    """
-    UC Mode 内建绕过机制：
-    - uc_open_with_reconnect 打开页面时已自动处理大多数情况
-    - uc_gui_click_captcha   专门针对 Turnstile 复选框，模拟真人轨迹点击
-    """
     url = sb.get_current_url()
-
-    # 检查是否停在 Challenge 页
     is_challenge = (
         "challenge" in url
         or "turnstile" in url.lower()
         or sb.is_element_present("iframe[src*='challenges.cloudflare.com']")
     )
-
     if is_challenge:
         log("检测到 Cloudflare Turnstile，UC Mode 自动处理...")
         try:
-            sb.uc_gui_click_captcha()   # 模拟真人点击 Turnstile 复选框
+            sb.uc_gui_click_captcha()
             log("Turnstile 处理完毕")
         except Exception as e:
             warn(f"uc_gui_click_captcha 异常: {e}")
         time.sleep(3)
+
+# ── 🆕 关闭公告弹窗（Got it / ×）────────────────────────────
+def dismiss_popups(sb):
+    """
+    Witchly 首页/My Servers 页可能出现公告弹窗，包含
+    'Got it' 按钮或右上角 × 关闭按钮。循环尝试关掉所有弹窗。
+    """
+    closed = 0
+    for _ in range(5):           # 最多关 5 层弹窗
+        result = sb.execute_script("""
+            // 1. 找所有包含 'Got it' / 'Got It' / 'Close' 文字的按钮
+            var btns = document.querySelectorAll('button, [role="button"], a');
+            for (var i = 0; i < btns.length; i++) {
+                var t = (btns[i].innerText || '').trim().toLowerCase();
+                if (t === 'got it' || t === 'close' || t === '×' || t === 'x') {
+                    btns[i].click();
+                    return 'clicked:' + btns[i].innerText.trim();
+                }
+            }
+            // 2. 找带 modal / dialog / announcement 类的关闭按钮
+            var modals = document.querySelectorAll(
+                '[class*="modal"], [class*="dialog"], [class*="announcement"], [class*="popup"]'
+            );
+            for (var i = 0; i < modals.length; i++) {
+                var closeBtn = modals[i].querySelector('button, [role="button"]');
+                if (closeBtn) {
+                    closeBtn.click();
+                    return 'modal-close';
+                }
+            }
+            return 'none';
+        """)
+        if result == "none":
+            break
+        log(f"关闭弹窗: {result}")
+        closed += 1
+        time.sleep(0.8)
+    if closed:
+        log(f"共关闭 {closed} 个弹窗")
+        time.sleep(1)
 
 # ── Discord OAuth 授权 ────────────────────────────────────
 def handle_oauth(sb):
@@ -120,7 +242,6 @@ def handle_oauth(sb):
     for _ in range(12):
         if "discord.com" not in sb.get_current_url():
             return
-        # 滚动到底部让授权按钮可见
         sb.execute_script("""
             document.querySelectorAll('div').forEach(el => {
                 if (el.scrollHeight > el.clientHeight + 10) el.scrollTop = el.scrollHeight;
@@ -139,7 +260,7 @@ def handle_oauth(sb):
                 text = sb.get_text(sel).strip().lower()
                 if any(k in text for k in ("cancel", "deny", "取消")):
                     continue
-                sb.uc_click(sel)        # uc_click 模拟真人点击，防止 Discord 检测 bot
+                sb.uc_click(sel)
                 log(f"已授权: {text!r}")
                 time.sleep(2)
                 if "discord.com" not in sb.get_current_url():
@@ -152,7 +273,6 @@ def handle_oauth(sb):
 # ── Discord Token 注入登录 ────────────────────────────────
 def discord_login(sb):
     log("打开 Witchly 首页...")
-    # uc_open_with_reconnect：先以普通方式打开，检测到 Cloudflare 后自动断连重连绕过
     sb.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
     time.sleep(3)
     handle_cloudflare(sb)
@@ -160,7 +280,6 @@ def discord_login(sb):
 
     log(f"当前页面: {sb.get_current_url()}")
 
-    # 点击 Discord 登录按钮
     clicked = False
     for sel in [
         'button:contains("Sign In with Discord")',
@@ -170,7 +289,7 @@ def discord_login(sb):
     ]:
         try:
             if sb.is_element_visible(sel):
-                sb.uc_click(sel)        # uc_click 绕过点击检测
+                sb.uc_click(sel)
                 log(f"点击: {sel}")
                 clicked = True
                 break
@@ -178,7 +297,6 @@ def discord_login(sb):
             continue
 
     if not clicked:
-        # 兜底
         try:
             sb.uc_click('[class*="discord"]')
             clicked = True
@@ -189,14 +307,12 @@ def discord_login(sb):
         snap(sb, "login-btn-not-found")
         raise RuntimeError("未找到 Discord 登录按钮，请查看截图")
 
-    # 等待跳转到 Discord
     if not wait_for_url(sb, "discord.com", timeout=20):
         snap(sb, "discord-redirect-failed")
         raise RuntimeError("未能跳转到 Discord，当前: " + sb.get_current_url())
 
     log("已到达 Discord，注入 Token...")
 
-    # 通过 localStorage 注入 Token（与 FreezeHost 方案相同原理）
     sb.execute_script("""
         var token = arguments[0];
         var f = document.createElement('iframe');
@@ -216,11 +332,9 @@ def discord_login(sb):
 
     log("Token 注入成功")
 
-    # 处理 OAuth 授权页
     if "discord.com/oauth2/authorize" in sb.get_current_url():
         handle_oauth(sb)
 
-    # 等待跳回 Witchly
     if not wait_for_url(sb, "witchly.host", timeout=25):
         if "discord.com" in sb.get_current_url():
             handle_oauth(sb)
@@ -228,9 +342,12 @@ def discord_login(sb):
             snap(sb, "not-witchly")
             raise RuntimeError("未能跳回 Witchly，当前: " + sb.get_current_url())
 
-    # Witchly 本身可能也有 Cloudflare 验证
     handle_cloudflare(sb)
     time.sleep(2)
+
+    # 🆕 登录后关闭公告弹窗
+    dismiss_popups(sb)
+
     log(f"✅ 登录成功！当前: {sb.get_current_url()}")
 
 # ── 解析 Stability 时间 ───────────────────────────────────
@@ -257,6 +374,10 @@ def get_server_info(sb) -> dict:
     time.sleep(4)
     handle_cloudflare(sb)
     time.sleep(2)
+
+    # 🆕 关闭可能的弹窗，再读数据
+    dismiss_popups(sb)
+    time.sleep(1)
 
     info = sb.execute_script(f"""
         var SERVER_ID = "{SERVER_ID}";
@@ -288,26 +409,51 @@ def get_server_info(sb) -> dict:
             else if (/\\boffline\\b/.test(bodyText)) status = 'offline';
         }}
 
-        // Stability 文字
+        // 🆕 Stability 文字：优先找 STABILITY 标签旁的 <p class="text-xs ...">
         var stabilityText = '';
+
+        // 策略1: 找 <p>Stability</p> 的兄弟/邻近 <p>
         for (var i = 0; i < allEls.length; i++) {{
             var el = allEls[i];
-            if (el.children.length > 0) continue;
-            var t = (el.innerText || '').trim();
-            if (/^\\d+d\\s*\\d*h?$/.test(t) || /^\\d+h$/.test(t))
-                {{ stabilityText = t; break; }}
+            var t = (el.innerText || '').trim().toUpperCase();
+            if (t === 'STABILITY') {{
+                // 向上找父级，再往下找 text-xs 或 text-white 段落
+                var parent = el.parentElement;
+                if (parent) {{
+                    var siblings = parent.querySelectorAll('p, span');
+                    for (var j = 0; j < siblings.length; j++) {{
+                        var st = (siblings[j].innerText || '').trim();
+                        if (/\\d+[dh]/.test(st) && siblings[j] !== el) {{
+                            stabilityText = st;
+                            break;
+                        }}
+                    }}
+                }}
+                if (stabilityText) break;
+                // 再往上一层
+                var gp = parent && parent.parentElement;
+                if (gp) {{
+                    var gpSibs = gp.querySelectorAll('p, span');
+                    for (var j = 0; j < gpSibs.length; j++) {{
+                        var st = (gpSibs[j].innerText || '').trim();
+                        if (/\\d+[dh]/.test(st)) {{
+                            stabilityText = st;
+                            break;
+                        }}
+                    }}
+                }}
+                if (stabilityText) break;
+            }}
         }}
+
+        // 策略2: 找纯数字+d/h 格式的叶节点
         if (!stabilityText) {{
             for (var i = 0; i < allEls.length; i++) {{
                 var el = allEls[i];
-                if ((el.innerText || '').trim().toUpperCase() === 'STABILITY') {{
-                    var p = el.parentElement;
-                    if (p) {{
-                        var sib = p.querySelector('p, span, b, strong');
-                        if (sib) stabilityText = sib.innerText.trim();
-                    }}
-                    break;
-                }}
+                if (el.children.length > 0) continue;
+                var t = (el.innerText || '').trim();
+                if (/^\\d+d\\s*\\d*h?$/.test(t) || /^\\d+h$/.test(t) || /^\\d+d$/.test(t))
+                    {{ stabilityText = t; break; }}
             }}
         }}
 
@@ -333,8 +479,10 @@ def get_power_status(sb) -> str:
     handle_cloudflare(sb)
     time.sleep(2)
 
+    # 🆕 控制台页也可能有弹窗
+    dismiss_popups(sb)
+
     status = sb.execute_script("""
-        // 找纯文本徽章 RUNNING / OFFLINE 等
         var all = document.querySelectorAll('*');
         for (var i = 0; i < all.length; i++) {
             var el = all[i];
@@ -345,14 +493,12 @@ def get_power_status(sb) -> str:
             if (t === 'STARTING') return 'starting';
             if (t === 'STOPPING') return 'stopping';
         }
-        // 找按钮
         var btns = document.querySelectorAll('button');
         for (var i = 0; i < btns.length; i++) {
             var t = (btns[i].innerText || '').toLowerCase().trim();
             if (t === 'stop' || t === 'stop server' || t === 'restart') return 'running';
             if (t === 'start' || t === 'start server')                   return 'offline';
         }
-        // 正文兜底
         var body = document.body.innerText.toLowerCase();
         if (/\\brunning\\b/.test(body))               return 'running';
         if (/\\boffline\\b|\\bstopped\\b/.test(body)) return 'offline';
@@ -401,8 +547,8 @@ def renew_server(sb) -> bool:
     time.sleep(3)
     handle_cloudflare(sb)
     time.sleep(2)
+    dismiss_popups(sb)   # 🆕 续期前也关弹窗
 
-    # 点击 STABILITY 区紫色续期按钮
     clicked = sb.execute_script(f"""
         var SERVER_ID = "{SERVER_ID}";
         var card = null;
@@ -415,7 +561,6 @@ def renew_server(sb) -> bool:
         }}
         var root = card || document.body;
 
-        // 方法1：紫色背景按钮
         var btns = root.querySelectorAll('button, [role="button"]');
         for (var i = 0; i < btns.length; i++) {{
             var btn = btns[i];
@@ -428,7 +573,6 @@ def renew_server(sb) -> bool:
             }}
         }}
 
-        // 方法2：STABILITY 标签旁的按钮
         for (var i = 0; i < all.length; i++) {{
             var el = all[i];
             if ((el.innerText || '').trim().toUpperCase() === 'STABILITY') {{
@@ -443,7 +587,6 @@ def renew_server(sb) -> bool:
             }}
         }}
 
-        // 方法3：含时钟 SVG、title 含 renew/extend 的按钮
         for (var i = 0; i < btns.length; i++) {{
             var btn = btns[i];
             if (btn.querySelector('svg')) {{
@@ -464,9 +607,8 @@ def renew_server(sb) -> bool:
         snap(sb, "renew-not-found")
         return False
 
-    time.sleep(2)  # 等弹窗
+    time.sleep(2)
 
-    # 点击弹窗 Proceed
     for sel in [
         'button:contains("Proceed")',
         'button[class*="purple"]',
@@ -481,7 +623,6 @@ def renew_server(sb) -> bool:
         except Exception:
             continue
 
-    # JS 兜底
     r = sb.execute_script("""
         var btns = document.querySelectorAll('button');
         for (var i = 0; i < btns.length; i++) {
@@ -509,19 +650,20 @@ def run():
         raise RuntimeError("缺少: WITCHLY_SERVER_ID")
 
     log(f"▶ 监控服务器 [{SERVER_ID}]，续期阈值 < {RENEW_THRESHOLD_DAYS}d")
+    if ENABLE_RECORDING:
+        log("🎬 录屏已启用（设置 ENABLE_RECORDING=false 可关闭）")
     messages = []
 
-    # ── SeleniumBase UC Mode 关键参数 ────────────────────
-    # uc=True            启用 Undetected Chrome，伪装真实浏览器指纹
-    # headless=True      无头模式（GitHub Actions 必须）
-    # uc_cdp_events=True 监听 CDP 事件，增强反检测能力
-    # chromium_arg       CI 环境必要的 Chrome 启动参数
     with SB(
         uc=True,
         headless=True,
         uc_cdp_events=True,
         chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
     ) as sb:
+        # 🆕 启动录屏
+        recorder = ScreenRecorder(sb, interval=2.0)
+        recorder.start()
+
         try:
             # ① 登录
             discord_login(sb)
@@ -606,7 +748,15 @@ def run():
             err(f"异常: {e}")
             send_tg(f"【Witchly 监控】❌ 脚本异常\n{e}", snap(sb, "error"))
             traceback.print_exc()
+            # 录屏仍然保存
+            recorder.stop("run-error")
             sys.exit(1)
+
+        finally:
+            # 🆕 停止录屏，生成视频
+            video = recorder.stop("run")
+            if video:
+                log(f"录屏保存于: {video}")
 
     log("▶ 完成")
 
