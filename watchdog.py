@@ -35,6 +35,8 @@ ENABLE_RECORDING     = os.environ.get("ENABLE_RECORDING", "true").strip().lower(
 BASE_URL       = "https://dash.witchly.host"
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
+REC_FRAME_DIR  = Path("screenshots/rec")   # 录屏帧单独放，不污染截图目录
+REC_FRAME_DIR.mkdir(exist_ok=True)
 RECORDING_DIR  = Path("recordings")
 RECORDING_DIR.mkdir(exist_ok=True)
 
@@ -113,7 +115,7 @@ class ScreenRecorder:
         while self._running:
             try:
                 name = f"rec_{self._idx:04d}"
-                path = SCREENSHOT_DIR / f"{name}.png"
+                path = REC_FRAME_DIR / f"{name}.png"   # 存到 screenshots/rec/
                 self.sb.save_screenshot(str(path))
                 self._frames.append(path)
                 self._idx += 1
@@ -238,8 +240,7 @@ def dismiss_popups(sb):
 # ── Discord OAuth 授权 ────────────────────────────────────
 def handle_oauth(sb):
     log("处理 Discord OAuth 授权...")
-    time.sleep(2)
-    for _ in range(12):
+    for _ in range(10):
         if "discord.com" not in sb.get_current_url():
             return
         sb.execute_script("""
@@ -248,7 +249,6 @@ def handle_oauth(sb):
             });
             window.scrollTo(0, document.body.scrollHeight);
         """)
-        time.sleep(0.8)
         for sel in [
             'button:contains("Authorize")',
             'button:contains("授权")',
@@ -262,23 +262,29 @@ def handle_oauth(sb):
                     continue
                 sb.uc_click(sel)
                 log(f"已授权: {text!r}")
-                time.sleep(2)
-                if "discord.com" not in sb.get_current_url():
+                # 等跳回 witchly，最多 5 秒
+                if wait_for_url(sb, "witchly.host", timeout=5):
                     return
                 break
             except Exception:
                 continue
-        time.sleep(1.5)
+        time.sleep(0.8)
 
 # ── Discord Token 注入登录 ────────────────────────────────
 def discord_login(sb):
     log("打开 Witchly 首页...")
-    sb.uc_open_with_reconnect(BASE_URL, reconnect_time=4)
-    time.sleep(3)
+    sb.uc_open_with_reconnect(BASE_URL, reconnect_time=2)  # 从 4 → 2
+    # 等页面真正加载（URL 稳定），最多 8 秒
+    wait_for_url(sb, "witchly.host", timeout=8)
     handle_cloudflare(sb)
-    time.sleep(2)
 
     log(f"当前页面: {sb.get_current_url()}")
+
+    # 如果已登录直接跳过
+    if "dash.witchly.host" in sb.get_current_url() and "/servers" in sb.get_current_url():
+        log("已登录，跳过登录步骤")
+        dismiss_popups(sb)
+        return
 
     clicked = False
     for sel in [
@@ -307,7 +313,7 @@ def discord_login(sb):
         snap(sb, "login-btn-not-found")
         raise RuntimeError("未找到 Discord 登录按钮，请查看截图")
 
-    if not wait_for_url(sb, "discord.com", timeout=20):
+    if not wait_for_url(sb, "discord.com", timeout=15):
         snap(sb, "discord-redirect-failed")
         raise RuntimeError("未能跳转到 Discord，当前: " + sb.get_current_url())
 
@@ -324,7 +330,8 @@ def discord_login(sb):
     """, DISCORD_TOKEN)
 
     sb.refresh()
-    time.sleep(4)
+    # 等 Discord 重定向，不用固定 sleep
+    time.sleep(1.5)
 
     if "discord.com/login" in sb.get_current_url():
         snap(sb, "token-invalid")
@@ -335,17 +342,14 @@ def discord_login(sb):
     if "discord.com/oauth2/authorize" in sb.get_current_url():
         handle_oauth(sb)
 
-    if not wait_for_url(sb, "witchly.host", timeout=25):
+    if not wait_for_url(sb, "witchly.host", timeout=20):
         if "discord.com" in sb.get_current_url():
             handle_oauth(sb)
-        if not wait_for_url(sb, "witchly.host", timeout=15):
+        if not wait_for_url(sb, "witchly.host", timeout=10):
             snap(sb, "not-witchly")
             raise RuntimeError("未能跳回 Witchly，当前: " + sb.get_current_url())
 
     handle_cloudflare(sb)
-    time.sleep(2)
-
-    # 🆕 登录后关闭公告弹窗
     dismiss_popups(sb)
 
     log(f"✅ 登录成功！当前: {sb.get_current_url()}")
@@ -370,12 +374,10 @@ def fmt_days(v: float) -> str:
 # ── 读取 My Servers 页信息 ────────────────────────────────
 def get_server_info(sb) -> dict:
     log("打开 My Servers 页...")
-    sb.uc_open_with_reconnect(f"{BASE_URL}/servers", reconnect_time=3)
-    time.sleep(5)
+    sb.uc_open_with_reconnect(f"{BASE_URL}/servers", reconnect_time=2)
+    time.sleep(3)  # Next.js hydration 需要一点时间
     handle_cloudflare(sb)
-    time.sleep(2)
     dismiss_popups(sb)
-    time.sleep(1.5)
 
     # ── 策略A：直接读整页可见文字，用正则抓 Stability 值 ──
     # 截图证明 "6d 11h" 在页面上可见，innerText 应该能拿到
@@ -446,10 +448,9 @@ def open_manage_page(sb) -> bool:
     """
     # 先确保在 My Servers 页
     if "/servers" not in sb.get_current_url():
-        sb.uc_open_with_reconnect(f"{BASE_URL}/servers", reconnect_time=4)
-        time.sleep(4)
+        sb.uc_open_with_reconnect(f"{BASE_URL}/servers", reconnect_time=2)
+        time.sleep(3)
         handle_cloudflare(sb)
-        time.sleep(2)
         dismiss_popups(sb)
 
     log("点击 Manage 按钮进入控制台...")
@@ -498,9 +499,8 @@ def open_manage_page(sb) -> bool:
             break
         time.sleep(0.5)
 
-    time.sleep(3)
+    time.sleep(2)
     handle_cloudflare(sb)
-    time.sleep(1)
     dismiss_popups(sb)
 
     current = sb.get_current_url()
