@@ -371,144 +371,123 @@ def fmt_days(v: float) -> str:
 def get_server_info(sb) -> dict:
     log("打开 My Servers 页...")
     sb.uc_open_with_reconnect(f"{BASE_URL}/servers", reconnect_time=3)
-    time.sleep(4)
+    time.sleep(5)
     handle_cloudflare(sb)
     time.sleep(2)
-
-    # 🆕 关闭可能的弹窗，再读数据
     dismiss_popups(sb)
-    time.sleep(1)
+    time.sleep(1.5)
 
-    info = sb.execute_script(f"""
+    # ── 策略A：直接读整页可见文字，用正则抓 Stability 值 ──
+    # 截图证明 "6d 11h" 在页面上可见，innerText 应该能拿到
+    # 同时把 "STABILITY\n6d 11h" 这种换行格式也覆盖到
+    page_text = sb.execute_script("return document.body.innerText || '';")
+    log(f"[DEBUG] 页面文字片段: {page_text[:300]!r}")  # 调试用，确认能拿到文字
+
+    stability_text = ""
+    # 匹配 "STABILITY" 附近（上下 60 字符内）的 Nd Nh 格式
+    m = re.search(
+        r"STABILITY[\s\S]{0,60}?(\d+d\s*\d+h|\d+d\s*\d+m|\d+d|\d+h)",
+        page_text, re.IGNORECASE
+    )
+    if m:
+        stability_text = m.group(1).strip()
+    else:
+        # 退而求其次：页面任意位置找 Nd Nh
+        m2 = re.search(r"\b(\d+d\s+\d+h|\d+d\s+\d+m|\d+d|\d+h)\b", page_text)
+        if m2:
+            stability_text = m2.group(1).strip()
+
+    # ── 服务器在线状态：读绿点颜色 或 文字 ──
+    status = sb.execute_script(f"""
         var SERVER_ID = "{SERVER_ID}";
+        // 找包含 server id 的卡片
         var card = null;
         var all = document.querySelectorAll('*');
         for (var i = 0; i < all.length; i++) {{
-            var el = all[i];
-            var t = el.innerText || '';
-            if (t.includes(SERVER_ID) && el.children.length > 0 && el.children.length < 30)
-                card = el;
+            var t = all[i].textContent || '';
+            if (t.includes(SERVER_ID) && all[i].children.length > 0 && all[i].children.length < 40)
+                card = all[i];
         }}
         var root = card || document.body;
 
-        // 状态检测
-        var status = 'unknown';
-        var allEls = root.querySelectorAll('*');
-        for (var i = 0; i < allEls.length; i++) {{
-            var el = allEls[i];
-            var bg  = getComputedStyle(el).backgroundColor || '';
-            var cls = (el.className || '').toString();
-            if (bg.match(/rgb\\(34,\\s*197/) || cls.includes('green') || cls.includes('online'))
-                {{ status = 'online'; break; }}
-            if (bg.match(/rgb\\(239,\\s*68/) || cls.includes('offline') || cls.includes('stopped'))
-                {{ status = 'offline'; break; }}
-        }}
-        if (status === 'unknown') {{
-            var bodyText = (root.innerText || '').toLowerCase();
-            if (/\\bonline\\b/.test(bodyText))  status = 'online';
-            else if (/\\boffline\\b/.test(bodyText)) status = 'offline';
+        // 绿色圆点 = online（rgb 接近 34,197,94 即 green-500）
+        var dots = root.querySelectorAll('span, div, i');
+        for (var i = 0; i < dots.length; i++) {{
+            var bg = getComputedStyle(dots[i]).backgroundColor || '';
+            if (bg.match(/rgb\\(34,\\s*197/) || bg.match(/rgb\\(74,\\s*222/))
+                return 'online';
+            if (bg.match(/rgb\\(239,\\s*68/) || bg.match(/rgb\\(248,\\s*113/))
+                return 'offline';
         }}
 
-        // 🆕 Stability 文字：优先找 STABILITY 标签旁的 <p class="text-xs ...">
-        var stabilityText = '';
-
-        // 策略1: 找 <p>Stability</p> 的兄弟/邻近 <p>
-        for (var i = 0; i < allEls.length; i++) {{
-            var el = allEls[i];
-            var t = (el.innerText || '').trim().toUpperCase();
-            if (t === 'STABILITY') {{
-                // 向上找父级，再往下找 text-xs 或 text-white 段落
-                var parent = el.parentElement;
-                if (parent) {{
-                    var siblings = parent.querySelectorAll('p, span');
-                    for (var j = 0; j < siblings.length; j++) {{
-                        var st = (siblings[j].innerText || '').trim();
-                        if (/\\d+[dh]/.test(st) && siblings[j] !== el) {{
-                            stabilityText = st;
-                            break;
-                        }}
-                    }}
-                }}
-                if (stabilityText) break;
-                // 再往上一层
-                var gp = parent && parent.parentElement;
-                if (gp) {{
-                    var gpSibs = gp.querySelectorAll('p, span');
-                    for (var j = 0; j < gpSibs.length; j++) {{
-                        var st = (gpSibs[j].innerText || '').trim();
-                        if (/\\d+[dh]/.test(st)) {{
-                            stabilityText = st;
-                            break;
-                        }}
-                    }}
-                }}
-                if (stabilityText) break;
-            }}
-        }}
-
-        // 策略2: 找纯数字+d/h 格式的叶节点
-        if (!stabilityText) {{
-            for (var i = 0; i < allEls.length; i++) {{
-                var el = allEls[i];
-                if (el.children.length > 0) continue;
-                var t = (el.innerText || '').trim();
-                if (/^\\d+d\\s*\\d*h?$/.test(t) || /^\\d+h$/.test(t) || /^\\d+d$/.test(t))
-                    {{ stabilityText = t; break; }}
-            }}
-        }}
-
-        return {{ status: status, stabilityText: stabilityText }};
+        // 文字兜底
+        var txt = (root.textContent || '').toLowerCase();
+        if (/\\bonline\\b/.test(txt))  return 'online';
+        if (/\\boffline\\b/.test(txt)) return 'offline';
+        return 'unknown';
     """)
 
-    stab_days = parse_stability_days(info.get("stabilityText", ""))
-    stab_str  = f"{info.get('stabilityText','?')}" + (f" ({fmt_days(stab_days)})" if stab_days else "")
-    log(f"状态: {info['status']}  |  Stability: {stab_str}")
+    stab_days = parse_stability_days(stability_text)
+    stab_str  = (stability_text or "?") + (f" ({fmt_days(stab_days)})" if stab_days else "")
+    log(f"状态: {status}  |  Stability: {stab_str}")
 
     return {
-        "status":         info["status"],
-        "stability_text": info.get("stabilityText", ""),
+        "status":         status or "unknown",
+        "stability_text": stability_text,
         "stability_days": stab_days,
     }
 
 # ── 检测控制台电源状态 ────────────────────────────────────
 def get_power_status(sb) -> str:
-    url = f"{BASE_URL}/servers/{SERVER_ID}/manage/console"
-    log(f"打开控制台: {url}")
-    sb.uc_open_with_reconnect(url, reconnect_time=3)
-    time.sleep(5)
+    console_url = f"{BASE_URL}/servers/{SERVER_ID}/manage/console"
+    log(f"打开控制台: {console_url}")
+    sb.uc_open_with_reconnect(console_url, reconnect_time=4)
+    time.sleep(6)
     handle_cloudflare(sb)
     time.sleep(2)
-
-    # 🆕 控制台页也可能有弹窗
     dismiss_popups(sb)
 
-    status = sb.execute_script("""
-        var all = document.querySelectorAll('*');
-        for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            if (el.children.length > 0) continue;
-            var t = (el.innerText || '').trim().toUpperCase();
-            if (t === 'RUNNING')  return 'running';
-            if (t === 'OFFLINE')  return 'offline';
-            if (t === 'STARTING') return 'starting';
-            if (t === 'STOPPING') return 'stopping';
-        }
-        var btns = document.querySelectorAll('button');
+    # 确认真的导航到了控制台，否则重试一次
+    current = sb.get_current_url()
+    if "console" not in current and "manage" not in current:
+        warn(f"控制台导航失败，当前页: {current}，重试...")
+        snap(sb, "console-nav-failed")
+        sb.uc_open_with_reconnect(console_url, reconnect_time=6)
+        time.sleep(8)
+        handle_cloudflare(sb)
+        time.sleep(2)
+        dismiss_popups(sb)
+        current = sb.get_current_url()
+        log(f"重试后页面: {current}")
+
+    # 先读整页文字（和 Stability 同样的思路）
+    page_text = sb.execute_script("return document.body.innerText || '';").lower()
+    log(f"[DEBUG] 控制台文字片段: {page_text[:200]!r}")
+
+    # 从页面文字直接判断状态
+    for keyword, result in [
+        ("running",  "running"),
+        ("starting", "starting"),
+        ("stopping", "stopping"),
+        ("offline",  "offline"),
+        ("stopped",  "offline"),
+    ]:
+        if re.search(rf"\b{keyword}\b", page_text):
+            log(f"电源状态: {result}")
+            return result
+
+    # 按钮文字兜底
+    btn_status = sb.execute_script("""
+        var btns = document.querySelectorAll('button, [role="button"]');
         for (var i = 0; i < btns.length; i++) {
             var t = (btns[i].innerText || '').toLowerCase().trim();
             if (t === 'stop' || t === 'stop server' || t === 'restart') return 'running';
             if (t === 'start' || t === 'start server')                   return 'offline';
         }
-        var body = document.body.innerText.toLowerCase();
-        if (/\\brunning\\b/.test(body))               return 'running';
-        if (/\\boffline\\b|\\bstopped\\b/.test(body)) return 'offline';
-        if (/\\bstarting\\b/.test(body))              return 'starting';
-        if (/\\bstopping\\b/.test(body))              return 'stopping';
         return 'unknown';
     """)
-
-    log(f"电源状态: {status}")
-    return status or "unknown"
+    log(f"电源状态: {btn_status}")
+    return btn_status or "unknown"
 
 # ── 启动服务器 ────────────────────────────────────────────
 def start_server(sb) -> bool:
