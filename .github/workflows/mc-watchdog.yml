@@ -1,4 +1,4 @@
-name: MC Server Watchdog
+name: 🎮 MC 服务器自动监控
 
 on:
   schedule:
