@@ -528,8 +528,17 @@ def open_manage_page(sb) -> bool:
     实际 URL 是 /servers/{id}/manage/home，不是 /console。
     返回 True 表示成功进入 manage 页面。
     """
-    # 先确保在 My Servers 页
-    if "/servers" not in sb.get_current_url():
+    # 已经在 manage 页面，直接返回
+    if "/manage/" in sb.get_current_url():
+        return True
+
+    # 如果不在 My Servers 列表页，先导航过去
+    cur = sb.get_current_url()
+    on_servers_list = (
+        cur.rstrip("/").endswith("/servers") or
+        cur.rstrip("/").endswith("/servers#")
+    )
+    if not on_servers_list:
         sb.uc_open_with_reconnect(f"{BASE_URL}/servers", reconnect_time=2)
         time.sleep(3)
         handle_cloudflare(sb)
@@ -574,10 +583,10 @@ def open_manage_page(sb) -> bool:
         warn("未找到 Manage 按钮")
         return False
 
-    # 等待跳转到 manage 页面（URL 里包含 manage）
+    # 等待跳转到 manage 页面（URL 里包含 /manage/）
     deadline = time.time() + 15
     while time.time() < deadline:
-        if "manage" in sb.get_current_url():
+        if "/manage/" in sb.get_current_url():
             break
         time.sleep(0.5)
 
@@ -587,11 +596,52 @@ def open_manage_page(sb) -> bool:
 
     current = sb.get_current_url()
     log(f"控制台页面: {current}")
-    if "manage" not in current:
+    if "/manage/" not in current:
         snap(sb, "manage-nav-failed")
         warn(f"未能进入控制台，当前: {current}")
         return False
     return True
+
+
+# ── 在 manage 页面原地刷新读状态（启动后轮询用）────────────
+def read_manage_status(sb) -> str:
+    """
+    已在 /manage/home 页面时，直接刷新页面读取电源状态。
+    不需要重新找 Manage 按钮，避免启动过程中按钮消失的问题。
+    """
+    sb.refresh()
+    time.sleep(4)
+    handle_cloudflare(sb)
+    dismiss_popups(sb)
+
+    page_text = sb.execute_script("return document.body.innerText || '';")
+
+    status_match = re.search(
+        r"\b(ONLINE|OFFLINE|STARTING|STOPPING|RUNNING|STOPPED)\b",
+        page_text, re.IGNORECASE
+    )
+    if status_match:
+        raw = status_match.group(1).upper()
+        mapping = {
+            "ONLINE": "running", "RUNNING": "running",
+            "OFFLINE": "offline", "STOPPED": "offline",
+            "STARTING": "starting", "STOPPING": "stopping",
+        }
+        status = mapping.get(raw, "unknown")
+        log(f"  刷新状态: {status}（原文: {raw}）")
+        return status
+
+    btn_status = sb.execute_script("""
+        var btns = document.querySelectorAll('button, [role="button"]');
+        for (var i = 0; i < btns.length; i++) {
+            var t = (btns[i].innerText || '').toLowerCase().trim();
+            if (t === 'stop' || t === 'restart' || t === 'kill') return 'running';
+            if (t === 'start') return 'offline';
+        }
+        return 'unknown';
+    """)
+    log(f"  刷新状态（按钮）: {btn_status}")
+    return btn_status or "unknown"
 
 
 # ── 检测控制台电源状态 ────────────────────────────────────
@@ -859,9 +909,10 @@ def run():
                 start_server(sb)
                 time.sleep(6)
 
+                # 启动后留在 manage 页面原地刷新，不再找 Manage 按钮
                 final_power = "unknown"
                 for i in range(10):
-                    final_power = get_power_status(sb)
+                    final_power = read_manage_status(sb)
                     log(f"  等待启动 [{i+1}/10] {final_power}")
                     if final_power in ("running", "starting"):
                         break
