@@ -857,7 +857,7 @@ def run():
 
     log(f"▶ 监控服务器 [{SERVER_ID}]，续期阈值 < {RENEW_THRESHOLD_DAYS}d")
 
-    # Uptime Kuma 恢复(UP)触发时直接退出，不需要做任何操作
+    # Uptime Kuma 传入的状态（如果能拿到就提前判断）
     if UPTIME_STATUS == "up":
         log("✅ Uptime Kuma 状态为 UP（服务器已恢复），无需操作，退出")
         return
@@ -886,6 +886,12 @@ def run():
             stability_days = info["stability_days"]
             stability_text = info["stability_text"]
             snap(sb, "02-my-servers")
+
+            # Uptime Kuma 触发时（SKIP_RENEW=true），若服务器已 online 说明是 UP 恢复触发
+            # 无需做任何操作，直接退出
+            if SKIP_RENEW and info["status"] == "online":
+                log("✅ 服务器已在线（Uptime Kuma UP 恢复触发），无需操作，退出")
+                return
 
             # ③ 续期检查（Uptime Kuma 紧急触发时跳过）
             if SKIP_RENEW:
