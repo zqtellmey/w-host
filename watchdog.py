@@ -35,8 +35,21 @@ RENEW_THRESHOLD_DAYS = float(os.environ.get("RENEW_THRESHOLD_DAYS", "3"))
 ENABLE_RECORDING     = os.environ.get("ENABLE_RECORDING", "true").strip().lower() == "true"
 # 由 Uptime Kuma webhook 触发时设为 true，跳过续期只做启动检查
 SKIP_RENEW           = os.environ.get("SKIP_RENEW", "false").strip().lower() == "true"
-# Uptime Kuma 传入的状态，UP 时直接退出不做任何操作
-UPTIME_STATUS        = os.environ.get("UPTIME_STATUS", "").strip().lower()
+# Uptime Kuma 传入的心跳状态，用于判断是 DOWN 还是 UP 触发
+_heartbeat_raw       = os.environ.get("UPTIME_HEARTBEAT", "").strip()
+_uptime_status_raw   = os.environ.get("UPTIME_STATUS", "").strip().lower()
+
+# 优先用 heartbeat JSON 解析，fallback 用直接传入的 status 字段
+try:
+    _hb = json.loads(_heartbeat_raw) if _heartbeat_raw else {}
+    UPTIME_STATUS = str(_hb.get("status", _uptime_status_raw)).lower()
+    # heartbeat status: 0=DOWN, 1=UP
+    if UPTIME_STATUS == "1":
+        UPTIME_STATUS = "up"
+    elif UPTIME_STATUS == "0":
+        UPTIME_STATUS = "down"
+except Exception:
+    UPTIME_STATUS = _uptime_status_raw
 
 BASE_URL       = "https://dash.witchly.host"
 SCREENSHOT_DIR = Path("screenshots")
