@@ -83,38 +83,36 @@ def send_tg(text: str, img_path: str | None = None):
 
 # ── WxPusher 推送 ─────────────────────────────────────────
 def send_wx(title: str, content: str):
-    """
-    WxPusher 文字推送。
-    需要配置环境变量：
-      WX_APP_TOKEN  —— WxPusher 应用的 AppToken
-      WX_UID        —— 接收人 UID（多个用英文逗号分隔）
-    获取方式：https://wxpusher.zjiecode.com/docs
-    """
     if not WX_APP_TOKEN or not WX_UID:
         return
-    try:
-        uids = [u.strip() for u in WX_UID.split(",") if u.strip()]
-        payload = {
-            "appToken": WX_APP_TOKEN,
-            "content":  content,
-            "summary":  title,          # 消息列表里显示的摘要
-            "contentType": 1,           # 1=文字，2=HTML，3=Markdown
-            "uids": uids,
-        }
-        req = Request(
-            "https://wxpusher.zjiecode.com/api/send/message",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read())
-            if result.get("success"):
-                log("WxPusher 推送成功")
-            else:
-                warn(f"WxPusher 返回异常: {result.get('msg')}")
-    except Exception as e:
-        warn(f"WxPusher 推送失败: {e}")
+    uids = [u.strip() for u in WX_UID.split(",") if u.strip()]
+    payload = {
+        "appToken":    WX_APP_TOKEN,
+        "content":     content,
+        "summary":     title,
+        "contentType": 1,
+        "uids":        uids,
+    }
+    for attempt in range(3):   # 最多重试 3 次
+        try:
+            req = Request(
+                "https://wxpusher.zjiecode.com/api/send/message",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=10) as resp:   # 10s 超时，失败快，重试快
+                result = json.loads(resp.read())
+                if result.get("success"):
+                    log("WxPusher 推送成功")
+                    return
+                else:
+                    warn(f"WxPusher 返回异常: {result.get('msg')}")
+                    return   # 返回异常不是网络问题，不重试
+        except Exception as e:
+            warn(f"WxPusher 推送失败 [{attempt+1}/3]: {e}")
+            if attempt < 2:
+                time.sleep(3)   # 等 3 秒再重试
 
 # ── 统一推送入口 ──────────────────────────────────────────
 def send_notify(title: str, content: str, img_path: str | None = None):
@@ -909,22 +907,30 @@ def run():
                 start_server(sb)
                 time.sleep(6)
 
-                # 启动后留在 manage 页面原地刷新，不再找 Manage 按钮
+                # 启动后留在 manage 页面原地刷新，等到真正 ONLINE 才算成功
                 final_power = "unknown"
-                for i in range(10):
+                for i in range(15):   # 最多等 15 次 × 10s = 150s
                     final_power = read_manage_status(sb)
-                    log(f"  等待启动 [{i+1}/10] {final_power}")
-                    if final_power in ("running", "starting"):
+                    log(f"  等待启动 [{i+1}/15] {final_power}")
+                    if final_power == "running":   # 只有 ONLINE 才算成功
                         break
-                    time.sleep(6)
+                    if final_power == "offline":   # 启动失败，提前退出
+                        warn("  服务器启动失败，状态回到 offline")
+                        break
+                    time.sleep(10)   # starting 就继续等
 
                 snap(sb, "05-after-start")
                 log(f"服务器启动结果: {final_power}")
-                # ✅ 只在检测到离线并触发启动时推送
-                send_notify(
-                    title   = "🚀 Witchly 服务器离线已重启",
-                    content = "检测到服务器离线，已自动执行 Start 命令重新启动。",
-                )
+                if final_power == "running":
+                    send_notify(
+                        title   = "🚀 Witchly 服务器已重新上线",
+                        content = "检测到服务器离线，已自动执行 Start，服务器现已 ONLINE。",
+                    )
+                else:
+                    send_notify(
+                        title   = "⚠️ Witchly 服务器启动中",
+                        content = f"已发送 Start 指令，当前状态：{final_power}，请稍后手动确认是否在线。",
+                    )
 
             elif power in ("starting", "stopping"):
                 log(f"⏳ 服务器 {power} 中...")
