@@ -1,12 +1,9 @@
 name: 🚨 服务器离线紧急启动（Uptime Kuma 触发）
 
 on:
-  workflow_dispatch:
-    inputs:
-      reason:
-        description: '触发原因'
-        required: false
-        default: 'Uptime Kuma detected DOWN'
+  repository_dispatch:
+    types: [server-down]   # Uptime Kuma POST Body 里的 event_type 对应这里
+  workflow_dispatch:       # 保留手动触发入口，方便测试
 
 jobs:
   restart:
@@ -58,7 +55,7 @@ jobs:
           sleep 2
 
       - name: 打印触发原因
-        run: echo "触发原因：${{ github.event.inputs.reason }}"
+        run: echo "触发原因：${{ github.event.client_payload.reason || github.event.inputs.reason || 'Uptime Kuma' }}"
 
       - name: 运行监控脚本（跳过续期，只做启动）
         env:
