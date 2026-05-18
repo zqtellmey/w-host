@@ -89,3 +89,13 @@ jobs:
           path: recordings/
           retention-days: 3
           if-no-files-found: ignore
+
+      - name: 清理旧运行记录（只保留最新 3 条）
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
