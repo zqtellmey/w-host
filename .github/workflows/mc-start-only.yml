@@ -70,6 +70,7 @@ jobs:
           ENABLE_RECORDING:      "true"
           SKIP_RENEW:            "true"
           UPTIME_STATUS:         ${{ github.event.client_payload.status }}
+          UPTIME_HEARTBEAT:      ${{ toJson(github.event.client_payload.heartbeat) }}
         run: python watchdog.py
 
       - name: 上传截图
