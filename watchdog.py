@@ -907,17 +907,27 @@ def run():
                 start_server(sb)
                 time.sleep(6)
 
-                # 启动后留在 manage 页面原地刷新，等到真正 ONLINE 才算成功
+                # 点完 Start 先等 15 秒，让服务器有时间从 offline 变 starting
+                log("  等待服务器响应 Start 指令（15秒）...")
+                time.sleep(15)
+
+                # 然后每 10 秒刷新一次，最多等 20 次（200秒）
+                # 只有 running(ONLINE) 才算成功，offline 连续出现 3 次才认为失败
                 final_power = "unknown"
-                for i in range(15):   # 最多等 15 次 × 10s = 150s
+                offline_count = 0
+                for i in range(20):
                     final_power = read_manage_status(sb)
-                    log(f"  等待启动 [{i+1}/15] {final_power}")
-                    if final_power == "running":   # 只有 ONLINE 才算成功
+                    log(f"  等待启动 [{i+1}/20] {final_power}")
+                    if final_power == "running":
                         break
-                    if final_power == "offline":   # 启动失败，提前退出
-                        warn("  服务器启动失败，状态回到 offline")
-                        break
-                    time.sleep(10)   # starting 就继续等
+                    elif final_power == "offline":
+                        offline_count += 1
+                        if offline_count >= 3:
+                            warn("  连续 3 次检测到 offline，确认启动失败")
+                            break
+                    else:
+                        offline_count = 0  # starting/unknown 重置计数
+                    time.sleep(10)
 
                 snap(sb, "05-after-start")
                 log(f"服务器启动结果: {final_power}")
