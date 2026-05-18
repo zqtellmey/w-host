@@ -1,0 +1,94 @@
+name: 🚨 服务器离线紧急启动（Uptime Kuma 触发）
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '触发原因'
+        required: false
+        default: 'Uptime Kuma detected DOWN'
+
+jobs:
+  restart:
+    name: 紧急启动服务器
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 SeleniumBase
+        run: pip install seleniumbase
+
+      - name: 安装系统依赖（Chrome + ffmpeg）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libglib2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxcursor1 libxdamage1 \
+            libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
+            libxss1 libxtst6 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libgbm1 \
+            fonts-liberation xvfb ffmpeg
+
+      - name: 启动虚拟显示（Xvfb）
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 &
+          echo "DISPLAY=:99" >> $GITHUB_ENV
+          sleep 2
+
+      - name: 启用 Cloudflare WARP
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 修复 DNS
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
+          sleep 2
+
+      - name: 打印触发原因
+        run: echo "触发原因：${{ github.event.inputs.reason }}"
+
+      - name: 运行监控脚本（跳过续期，只做启动）
+        env:
+          WITCHLY_DISCORD_TOKEN: ${{ secrets.WITCHLY_DISCORD_TOKEN }}
+          WITCHLY_SERVER_ID:     ${{ secrets.WITCHLY_SERVER_ID }}
+          WX_APP_TOKEN:          ${{ secrets.WX_APP_TOKEN }}
+          WX_UID:                ${{ secrets.WX_UID }}
+          TG_BOT_TOKEN:          ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:            ${{ secrets.TG_CHAT_ID }}
+          RENEW_THRESHOLD_DAYS:  "3"
+          DISPLAY:               ":99"
+          ENABLE_RECORDING:      "true"
+          SKIP_RENEW:            "true"
+        run: python watchdog.py
+
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emergency-screenshots-${{ github.run_number }}
+          path: |
+            screenshots/
+            !screenshots/rec/
+          retention-days: 3
+
+      - name: 上传录屏
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emergency-recording-${{ github.run_number }}
+          path: recordings/
+          retention-days: 3
+          if-no-files-found: ignore
